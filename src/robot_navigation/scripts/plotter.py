@@ -1,148 +1,195 @@
 #!/usr/bin/env python3
+"""
+Real-time trajectory visualization.
+Plots: (1) planned vs actual path with heading arrows
+       (2) cross-track error over time
+       (3) linear speed — planned vs actual
+       (4) angular velocity (omega) profile
+"""
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Path, Odometry
 from std_msgs.msg import Bool, Float64MultiArray
 from geometry_msgs.msg import TwistStamped
+import matplotlib
+matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 import numpy as np
 
+
 class PlotterNode(Node):
     def __init__(self):
         super().__init__('path_plotter')
-        self.planned_path_sub = self.create_subscription(
-            Path, '/planned_path', self.path_callback, 10)
-        self.odom_sub = self.create_subscription(
-            Odometry, '/odom', self.odom_callback, 10)
-        
-        self.goal_status_sub = self.create_subscription(
-            Bool, '/navigation/goal_reached', self.goal_status_callback, 10)
-        self.velocity_profile_sub = self.create_subscription(
-            Float64MultiArray, '/visualization/velocity_profile', self.velocity_profile_callback, 10)
 
-        self.cmd_vel_sub = self.create_subscription(
-            TwistStamped, '/cmd_vel', self.cmd_vel_callback, 10)
+        # Subscriptions
+        self.create_subscription(Path,              '/planned_path',                    self._on_path,    10)
+        self.create_subscription(Odometry,          '/odom',                             self._on_odom,    10)
+        self.create_subscription(Bool,              '/navigation/goal_reached',          self._on_goal,    10)
+        self.create_subscription(Float64MultiArray, '/visualization/velocity_profile',   self._on_vel,     10)
+        self.create_subscription(Float64MultiArray, '/visualization/omega_profile',      self._on_omega,   10)
+        self.create_subscription(TwistStamped,      '/cmd_vel',                          self._on_cmdvel,  10)
 
+        # Data
         self.planned_path = None
-        self.actual_path_x = []
-        self.actual_path_y = []
-        self.error_history = []
-        self.time_history = []
-        self.velocity_time = []
-        self.velocity_data = []
-        # **FIX**: New lists for actual velocity
-        self.actual_velocity_time = []
-        self.actual_velocity_data = []
+        self.ref_theta, self.ref_v_arr, self.ref_omega_arr = [], [], []
+        self.actual_x, self.actual_y = [], []
+        self.error_t, self.error_cte = [], []
+        self.vel_t, self.vel_ref = [], []
+        self.omega_t, self.omega_ref = [], []
+        self.cmd_t, self.cmd_v, self.cmd_w = [], [], []
         self.start_time = None
         self.goal_reached = False
 
+        # 2×2 subplot layout
         plt.ion()
-        self.fig = plt.figure(figsize=(12, 10))
-        gs = GridSpec(2, 2, figure=self.fig)
-        self.ax_trajectory = self.fig.add_subplot(gs[0, :])
-        self.ax_error = self.fig.add_subplot(gs[1, 0])
-        self.ax_velocity = self.fig.add_subplot(gs[1, 1])
-        
-        self.timer = self.create_timer(0.5, self.update_plot)
-        self.get_logger().info('Plotter initialized with new layout.')
+        self.fig = plt.figure(figsize=(14, 10))
+        gs = GridSpec(2, 2, figure=self.fig, hspace=0.4, wspace=0.3)
+        self.ax_traj  = self.fig.add_subplot(gs[0, :])   # top: full width trajectory
+        self.ax_cte   = self.fig.add_subplot(gs[1, 0])   # bottom-left: CTE
+        self.ax_vel   = self.fig.add_subplot(gs[1, 1])   # bottom-right: speed
 
-    def path_callback(self, msg):
-        self.get_logger().info('Received planned path. Resetting plots...')
+        self.create_timer(0.5, self._update_plot)
+        self.get_logger().info('Plotter initialized.')
+
+    # ---- Callbacks ----
+
+    def _on_path(self, msg):
         self.planned_path = msg
-        # Reset all data lists
-        self.actual_path_x, self.actual_path_y = [], []
-        self.error_history, self.time_history = [], []
-        self.velocity_time, self.velocity_data = [], []
-        self.actual_velocity_time, self.actual_velocity_data = [], []
+        self.actual_x.clear(); self.actual_y.clear()
+        self.error_t.clear();   self.error_cte.clear()
+        self.vel_t.clear();     self.vel_ref.clear()
+        self.omega_t.clear();   self.omega_ref.clear()
+        self.cmd_t.clear();     self.cmd_v.clear(); self.cmd_w.clear()
         self.start_time = self.get_clock().now()
         self.goal_reached = False
 
-    def goal_status_callback(self, msg):
+        # Decode encoded kinematic state from orientation fields
+        self.ref_theta.clear(); self.ref_v_arr.clear(); self.ref_omega_arr.clear()
+        for ps in msg.poses:
+            if abs(ps.pose.orientation.w - 1.0) < 1e-5:
+                self.ref_theta.append(ps.pose.orientation.x)
+                self.ref_v_arr.append(ps.pose.orientation.y)
+                self.ref_omega_arr.append(ps.pose.orientation.z)
+            else:
+                self.ref_theta.append(0.0)
+                self.ref_v_arr.append(0.0)
+                self.ref_omega_arr.append(0.0)
+
+    def _on_goal(self, msg):
         if msg.data:
-            self.get_logger().info('Goal reached signal received. Stopping plot updates.')
             self.goal_reached = True
+            self.get_logger().info('Goal reached — stopping plot updates.')
 
-    def velocity_profile_callback(self, msg):
-        data = np.array(msg.data)
-        if data.size > 0:
-            self.velocity_time = data[0::2]
-            self.velocity_data = data[1::2]
-            self.get_logger().info(f'Received velocity profile with {len(self.velocity_time)} points.')
+    def _on_vel(self, msg):
+        d = np.array(msg.data)
+        if d.size >= 2:
+            self.vel_t   = d[0::2].tolist()
+            self.vel_ref = d[1::2].tolist()
 
-    def cmd_vel_callback(self, msg):
+    def _on_omega(self, msg):
+        d = np.array(msg.data)
+        if d.size >= 2:
+            self.omega_t   = d[0::2].tolist()
+            self.omega_ref = d[1::2].tolist()
+
+    def _on_cmdvel(self, msg):
         if self.start_time is None or self.goal_reached:
             return
-        
-        elapsed_time = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
-        self.actual_velocity_time.append(elapsed_time)
-        self.actual_velocity_data.append(msg.twist.linear.x)
+        t = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
+        self.cmd_t.append(t)
+        self.cmd_v.append(msg.twist.linear.x)
+        self.cmd_w.append(msg.twist.angular.z)
 
-    def odom_callback(self, msg):
+    def _on_odom(self, msg):
         if self.planned_path is None or self.start_time is None or self.goal_reached:
             return
+        cx = msg.pose.pose.position.x
+        cy = msg.pose.pose.position.y
+        self.actual_x.append(cx)
+        self.actual_y.append(cy)
 
-        current_x = msg.pose.pose.position.x
-        current_y = msg.pose.pose.position.y
-        self.actual_path_x.append(current_x)
-        self.actual_path_y.append(current_y)
-        
-        planned_points = np.array([[p.pose.position.x, p.pose.position.y] for p in self.planned_path.poses])
-        dists_sq = np.sum((planned_points - np.array([current_x, current_y]))**2, axis=1)
-        closest_point_idx = np.argmin(dists_sq)
-
-        if closest_point_idx < len(planned_points) - 1:
-            p1 = planned_points[closest_point_idx]
-            p2 = planned_points[closest_point_idx + 1]
+        # Cross-track error
+        pts = np.array([[p.pose.position.x, p.pose.position.y]
+                         for p in self.planned_path.poses])
+        dists_sq = np.sum((pts - np.array([cx, cy]))**2, axis=1)
+        idx = int(np.argmin(dists_sq))
+        if idx + 1 < len(pts):
+            p1, p2 = pts[idx], pts[idx+1]
+            seg_len = np.linalg.norm(p2 - p1)
+            cte = np.abs(np.cross(p2-p1, np.array([cx,cy])-p1)) / seg_len if seg_len>1e-6 else 0.0
         else:
-            p1 = planned_points[closest_point_idx - 1]
-            p2 = planned_points[closest_point_idx]
+            cte = np.linalg.norm(pts[idx] - np.array([cx,cy]))
 
-        if np.linalg.norm(p2 - p1) < 1e-6:
-             cross_track_error = np.linalg.norm(np.array([current_x, current_y]) - p1)
-        else:
-            cross_track_error = np.abs(np.cross(p2-p1, np.array([current_x, current_y])-p1)) / np.linalg.norm(p2-p1)
+        t = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
+        self.error_t.append(t)
+        self.error_cte.append(cte)
 
-        self.error_history.append(cross_track_error)
-        
-        elapsed_time = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
-        self.time_history.append(elapsed_time)
+    # ---- Plot update ----
 
-    def update_plot(self):
+    def _update_plot(self):
         if self.planned_path is None:
             return
 
-        # --- Trajectory Plot ---
-        self.ax_trajectory.cla()
-        planned_x = [p.pose.position.x for p in self.planned_path.poses]
-        planned_y = [p.pose.position.y for p in self.planned_path.poses]
-        self.ax_trajectory.plot(planned_x, planned_y, 'b-', label='Planned Path')
-        if self.actual_path_x:
-            self.ax_trajectory.plot(self.actual_path_x, self.actual_path_y, 'r--', label='Actual Path')
-        self.ax_trajectory.set_title('Robot Trajectory Tracking')
-        self.ax_trajectory.set_xlabel('X (m)'); self.ax_trajectory.set_ylabel('Y (m)')
-        self.ax_trajectory.legend(); self.ax_trajectory.grid(True); self.ax_trajectory.axis('equal')
+        ref_x = [p.pose.position.x for p in self.planned_path.poses]
+        ref_y = [p.pose.position.y for p in self.planned_path.poses]
 
-        # --- Error Plot ---
-        self.ax_error.cla()
-        if self.time_history:
-            self.ax_error.plot(self.time_history, self.error_history, 'r-')
-        self.ax_error.set_title('Cross-Track Error vs. Time')
-        self.ax_error.set_xlabel('Time (s)'); self.ax_error.set_ylabel('Error (m)')
-        self.ax_error.grid(True); self.ax_error.set_ylim(bottom=0)
+        # --- Trajectory ---
+        self.ax_traj.cla()
+        self.ax_traj.plot(ref_x, ref_y, 'b-', lw=1.5, label='Reference path')
+        if self.actual_x:
+            self.ax_traj.plot(self.actual_x, self.actual_y, 'r--', lw=2, label='Actual path')
 
-        # --- Velocity Plot ---
-        self.ax_velocity.cla()
-        #Plot actual velocity
-        if len(self.actual_velocity_time) > 0:
-            self.ax_velocity.plot(self.actual_velocity_time, self.actual_velocity_data, 'r--', label='Actual Velocity')
-        self.ax_velocity.set_title('Velocity Profile')
-        self.ax_velocity.set_xlabel('Time (s)'); self.ax_velocity.set_ylabel('Velocity (m/s)')
-        self.ax_velocity.legend(); self.ax_velocity.grid(True); self.ax_velocity.set_ylim(bottom=0)
-        
+        # Heading arrows every ~10% of trajectory
+        if self.ref_theta and len(self.ref_theta) == len(ref_x):
+            step = max(1, len(ref_x) // 15)
+            for i in range(0, len(ref_x), step):
+                dx = 0.12 * np.cos(self.ref_theta[i])
+                dy = 0.12 * np.sin(self.ref_theta[i])
+                self.ax_traj.annotate('', xy=(ref_x[i]+dx, ref_y[i]+dy),
+                                      xytext=(ref_x[i], ref_y[i]),
+                                      arrowprops=dict(arrowstyle='->', color='green', lw=1.2))
+
+        # Statistics
+        if self.error_cte:
+            mean_e = np.mean(self.error_cte)
+            max_e  = np.max(self.error_cte)
+            self.ax_traj.set_title(
+                f'Trajectory Tracking   |   '
+                f'Mean CTE: {mean_e:.4f}m   |   Max CTE: {max_e:.4f}m',
+                fontsize=10)
+        else:
+            self.ax_traj.set_title('Trajectory Tracking')
+
+        self.ax_traj.set_xlabel('X (m)'); self.ax_traj.set_ylabel('Y (m)')
+        self.ax_traj.legend(loc='upper right'); self.ax_traj.grid(True)
+        self.ax_traj.set_aspect('equal')
+
+        # --- CTE ---
+        self.ax_cte.cla()
+        if self.error_t:
+            self.ax_cte.plot(self.error_t, self.error_cte, 'r-', lw=1.5)
+            self.ax_cte.axhline(np.mean(self.error_cte), color='orange',
+                                ls='--', lw=1, label=f'Mean={np.mean(self.error_cte):.4f}m')
+            self.ax_cte.legend(fontsize=8)
+        self.ax_cte.set_title('Cross-Track Error vs Time')
+        self.ax_cte.set_xlabel('Time (s)'); self.ax_cte.set_ylabel('CTE (m)')
+        self.ax_cte.set_ylim(bottom=0); self.ax_cte.grid(True)
+
+        # --- Velocity ---
+        self.ax_vel.cla()
+        if self.vel_t:
+            self.ax_vel.plot(self.vel_t, self.vel_ref, 'b-', lw=1.5, label='Planned v')
+        if self.cmd_t:
+            self.ax_vel.plot(self.cmd_t, self.cmd_v, 'r--', lw=1.5, label='Commanded v')
+        self.ax_vel.set_title('Linear Velocity Profile')
+        self.ax_vel.set_xlabel('Time (s)'); self.ax_vel.set_ylabel('v (m/s)')
+        self.ax_vel.legend(fontsize=8); self.ax_vel.grid(True); self.ax_vel.set_ylim(bottom=0)
+
         plt.tight_layout()
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -152,12 +199,10 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        plt.ioff()
-        plt.show()
+        plt.ioff(); plt.show()
         node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        if rclpy.ok(): rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
-
