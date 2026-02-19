@@ -1,14 +1,19 @@
 <?xml version="1.0"?>
-<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd"
+            schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>robot_navigation</name>
-  <version>0.0.1</version>
-  <description>A package for path smoothing and trajectory tracking for a differential drive robot.</description>
+  <version>0.1.0</version>
+  <description>
+    Quintic Hermite path smoothing with LPV-MPC trajectory tracking
+    for differential-drive robots in ROS2 Jazzy.
+  </description>
   <maintainer email="student@todo.todo">student</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
+  <!-- Core ROS2 -->
   <depend>rclcpp</depend>
   <depend>nav_msgs</depend>
   <depend>geometry_msgs</depend>
@@ -18,6 +23,16 @@
   <depend>tf2_ros</depend>
   <depend>yaml-cpp</depend>
   <depend>ament_index_cpp</depend>
+
+  <!-- Math / Optimization -->
+  <depend>eigen3_cmake_module</depend>   <!-- Eigen3 (header-only, ships with ROS2) -->
+  <depend>osqp_vendor</depend>           <!-- OSQP QP solver -->
+  <depend>osqp-eigen</depend>            <!-- OsqpEigen C++ wrapper -->
+
+  <!-- Python scripts -->
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-matplotlib</exec_depend>
+  <!-- Optional: pip install plotly for interactive HTML reports -->
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
