@@ -8,6 +8,7 @@ Panels:
         - /RobotModel1
         - /TF1
         - /Path1
+        - /MPC Horizon1
       Splitter Ratio: 0.5
     Tree Height: 363
   - Class: rviz_common/Views
@@ -121,8 +122,8 @@ Visualization Manager:
       Marker Scale: 0.30000001192092896
       Name: TF
       Show Arrows: true
-      Show Axes: true
-      Show Names: true
+      Show Axes: false
+      Show Names: false
       Tree:
         odom:
           base_footprint:
@@ -190,6 +191,35 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /visualization/obstacles
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz_default_plugins/Path
+      Color: 255; 0; 0
+      Enabled: true
+      Head Diameter: 0.20000000298023224
+      Head Length: 0.10000000149011612
+      Length: 0.20000000298023224
+      Line Style: Lines
+      Line Width: 0.019999999552965164
+      Name: MPC Horizon
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Line Style: Billboards
+      Pose Color: 255; 100; 100
+      Pose Style: None
+      Radius: 0.019999999552965164
+      Shaft Diameter: 0.05000000074505806
+      Shaft Length: 0.05000000074505806
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /visualization/mpc_horizon
       Value: true
   Enabled: true
   Global Options:
