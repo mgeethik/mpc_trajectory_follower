@@ -81,6 +81,13 @@ def generate_launch_description():
         output='screen'
     )
 
+    mission_report = Node(
+        package='robot_navigation',
+        executable='mission_report.py',
+        name='mission_report',
+        output='screen'
+    )
+
     # -------------------------
     # 5. Return LaunchDescription
     # -------------------------
@@ -90,6 +97,7 @@ def generate_launch_description():
         waypoint_publisher,
         path_smoother,
         trajectory_tracker,
-        plotter_script
+        plotter_script,
+        mission_report
     ])
 
