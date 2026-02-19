@@ -1,21 +1,65 @@
-trajectory_tracker_node:
-  ros__parameters:
-    # --- Tune your PID values here ---
-    kp_angular: 3.0
-    ki_angular: 1.0
-    kd_angular: 0.7
-    kp_cross_track: 1.2
-    # ---------------------------------
-
-    max_linear_vel: 0.22
-    max_angular_vel: 2.84
-    goal_tolerance: 0.1
-
-# parameters for path smoother node
+# =====================================================
+# PATH SMOOTHER — Quintic Hermite Spline
+# =====================================================
 path_smoother_node:
   ros__parameters:
+    # "trapezoidal" (recommended) or "constant"
     velocity_profile: "trapezoidal"
-    max_velocity: 0.5
-    max_acceleration: 0.25
-    obstacle_radius: 0.35
-    safety_margin: 0.15
+
+    # Speed limits
+    max_velocity:     0.22     # m/s — must match TurtleBot3 max
+    max_acceleration: 0.10     # m/s² — reduce if robot jerks at start/stop
+
+    # Spline geometry
+    spline_ds:        0.02     # Arc-length spacing between trajectory points (m)
+                               # Smaller = denser, more accurate, higher memory
+
+    # Corner sharpness [0.0=very tight, 1.0=very smooth/wide]
+    # Increase if robot cuts corners; decrease if it overshoots on tight turns
+    corner_sharpness: 0.25
+
+    # Trajectory timestamp resolution
+    time_sample_interval: 0.1  # s (10 Hz timestamps in trajectory)
+
+    # Obstacle geometry
+    obstacle_radius:  0.35     # m — physical radius of obstacles
+    safety_margin:    0.20     # m — additional clearance; auto-scales if collision found
+
+# =====================================================
+# TRAJECTORY TRACKER — LPV-MPC
+# =====================================================
+trajectory_tracker_node:
+  ros__parameters:
+    max_linear_vel:  0.22      # m/s — must match path_smoother max_velocity
+    max_angular_vel: 2.84      # rad/s
+    goal_tolerance:  0.12      # m — distance to final waypoint to declare goal reached
+
+    # MPC solver settings
+    mpc_horizon: 20            # Prediction steps.
+                               # Reduce to 10 for slow hardware (Raspberry Pi, etc.)
+                               # Increase to 30-40 for better curve anticipation.
+    mpc_dt:      0.02          # s — must match control_loop timer period (50 Hz)
+
+    # State cost weights [px, py, theta]
+    # Higher q_x/q_y = tighter position tracking (may cause oscillation if too high)
+    # Higher q_theta = better heading alignment on curves (reduce if overshooting)
+    mpc_q_x:     150.0
+    mpc_q_y:     150.0
+    mpc_q_theta:  80.0
+
+    # Control effort weights [v, omega]
+    # Higher r_v = slower, gentler speed changes
+    # Higher r_w = gentler turning (reduces oscillation on straight segments)
+    mpc_r_v:  50.0
+    mpc_r_w:  50.0
+
+    # Terminal cost multiplier (Q_f = mpc_terminal_scale * Q)
+    # Higher = MPC "cares more" about reaching the end of the horizon accurately
+    mpc_terminal_scale: 5.0
+
+    # Adaptive lookahead: target_idx = closest_idx + lookahead
+    # lookahead = clamp(lookahead_min + lookahead_gain * |v|, min, max)
+    # Faster robot = larger lookahead = smoother tracking, less lag on curves
+    lookahead_min:  2
+    lookahead_max:  10
+    lookahead_gain: 20.0
