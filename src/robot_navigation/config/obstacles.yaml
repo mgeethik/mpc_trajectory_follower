@@ -1,0 +1,7 @@
+/**:
+  ros__parameters:
+    # List of obstacle center points [x, y]
+    obstacle_centers:
+      - "[2.5, 0.2]"
+      - "[4.8, 4.8]"
+      - "[0.2, 2.5]" 

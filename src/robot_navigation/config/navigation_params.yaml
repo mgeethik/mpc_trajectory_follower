@@ -1,0 +1,21 @@
+trajectory_tracker_node:
+  ros__parameters:
+    # --- Tune your PID values here ---
+    kp_angular: 3.0
+    ki_angular: 1.0
+    kd_angular: 0.7
+    kp_cross_track: 1.2
+    # ---------------------------------
+
+    max_linear_vel: 0.22
+    max_angular_vel: 2.84
+    goal_tolerance: 0.1
+
+# parameters for path smoother node
+path_smoother_node:
+  ros__parameters:
+    velocity_profile: "trapezoidal"
+    max_velocity: 0.5
+    max_acceleration: 0.25
+    obstacle_radius: 0.35
+    safety_margin: 0.15
