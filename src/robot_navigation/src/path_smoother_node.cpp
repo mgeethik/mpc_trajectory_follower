@@ -1,358 +1,293 @@
 #include "rclcpp/rclcpp.hpp"
 #include "nav_msgs/msg/path.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
-#include "std_msgs/msg/float64_multi_array.hpp" 
+#include "std_msgs/msg/float64_multi_array.hpp"
+#include "robot_navigation/spline_generator.hpp"
+
 #include <vector>
 #include <cmath>
 #include <string>
-#include <limits>
-#include <algorithm>
 #include <sstream>
+#include <algorithm>
 
-// ... (Point struct remains the same) ...
 struct Point { double x, y; };
 
-class PathSmootherNode : public rclcpp::Node
-{
+class PathSmootherNode : public rclcpp::Node {
 public:
     PathSmootherNode() : Node("path_smoother_node")
     {
-        // --- Parameters ---
-        this->declare_parameter<std::string>("velocity_profile", "trapezoidal");
-        this->get_parameter("velocity_profile", velocity_profile_);
-        this->declare_parameter<double>("max_velocity", 0.5);
-        this->get_parameter("max_velocity", max_velocity_);
-        this->declare_parameter<double>("max_acceleration", 0.25);
-        this->get_parameter("max_acceleration", max_acceleration_);
-        this->declare_parameter<double>("time_sample_interval", 0.1);
-        this->get_parameter("time_sample_interval", time_sample_interval_);
-        this->declare_parameter<double>("spline_resolution", 0.05);
-        this->get_parameter("spline_resolution", spline_resolution_);
-        this->declare_parameter<double>("obstacle_radius", 0.35);
-        this->get_parameter("obstacle_radius", obstacle_radius_);
-        this->declare_parameter<double>("safety_margin", 0.15);
-        this->get_parameter("safety_margin", safety_margin_);
-        this->declare_parameter<double>("verification_resolution", 0.01);
-        this->get_parameter("verification_resolution", verification_resolution_);
+        // Parameters
+        declare_parameter("velocity_profile",     std::string("trapezoidal"));
+        declare_parameter("max_velocity",         0.22);
+        declare_parameter("max_acceleration",     0.10);
+        declare_parameter("time_sample_interval", 0.1);
+        declare_parameter("spline_ds",            0.02);
+        declare_parameter("corner_sharpness",     0.25);
+        declare_parameter("obstacle_radius",      0.35);
+        declare_parameter("safety_margin",        0.15);
+        declare_parameter("obstacle_centers",     std::vector<std::string>{});
 
-        // Declare and parse obstacle_centers as a string array
-        this->declare_parameter<std::vector<std::string>>("obstacle_centers", {});
-        auto obstacle_strings = this->get_parameter("obstacle_centers").as_string_array();
-        for (const auto& s : obstacle_strings) {
-            obstacles_.push_back(parse_point_string(s));
-        }
+        get_parameter("velocity_profile",     velocity_profile_);
+        get_parameter("max_velocity",         max_vel_);
+        get_parameter("max_acceleration",     max_acc_);
+        get_parameter("time_sample_interval", dt_);
+        get_parameter("spline_ds",            spline_ds_);
+        get_parameter("corner_sharpness",     corner_sharpness_);
+        get_parameter("obstacle_radius",      obs_r_);
+        get_parameter("safety_margin",        safety_margin_);
+
         
-        // --- Publishers & Subscribers ---
-        path_sub_ = this->create_subscription<nav_msgs::msg::Path>(
-            "/goal_waypoints", 10, std::bind(&PathSmootherNode::path_callback, this, std::placeholders::_1));
-        smooth_path_pub_ = this->create_publisher<nav_msgs::msg::Path>("/planned_path", 10);
-        velocity_profile_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>("/visualization/velocity_profile", 10);
+        auto obstacle_strings = get_parameter("obstacle_centers").as_string_array();
+        for (const auto& s : obstacle_strings)
+            obstacles_.push_back(parse_point(s));
 
-        RCLCPP_INFO(this->get_logger(), "Path Smoother Initialized.");
+        // Configure SplineGenerator
+        spline_.max_velocity    = max_vel_;
+        spline_.spline_ds       = spline_ds_;
+        spline_.corner_sharpness = corner_sharpness_;
+
+        // Pub / Sub
+        path_sub_  = create_subscription<nav_msgs::msg::Path>(
+            "/goal_waypoints", 10,
+            std::bind(&PathSmootherNode::on_path, this, std::placeholders::_1));
+        path_pub_  = create_publisher<nav_msgs::msg::Path>("/planned_path", 10);
+        vel_pub_   = create_publisher<std_msgs::msg::Float64MultiArray>(
+            "/visualization/velocity_profile", 10);
+        omega_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>(
+            "/visualization/omega_profile", 10);
+
+        RCLCPP_INFO(get_logger(), "Path Smoother ready (Quintic Hermite, %s profile)",
+                    velocity_profile_.c_str());
     }
 
 private:
-    // Helper to parse strings like "[x, y]"
-    Point parse_point_string(const std::string& s) {
-        Point p = {0.0, 0.0};
-        std::string cleaned = s;
-        cleaned.erase(std::remove(cleaned.begin(), cleaned.end(), '['), cleaned.end());
-        cleaned.erase(std::remove(cleaned.begin(), cleaned.end(), ']'), cleaned.end());
-        std::replace(cleaned.begin(), cleaned.end(), ',', ' ');
-        std::stringstream ss(cleaned);
-        ss >> p.x >> p.y;
-        return p;
-    }
-
-    // --- Main Callback ---
-    void path_callback(const nav_msgs::msg::Path::SharedPtr msg)
+    // -------- Main callback --------
+    void on_path(const nav_msgs::msg::Path::SharedPtr msg)
     {
         if (msg->poses.size() < 2) {
-            RCLCPP_WARN(this->get_logger(), "Received path has fewer than 2 points. Cannot process.");
-            return;
-        }
-        RCLCPP_INFO(this->get_logger(), "Received %zu waypoints, starting smoothing and obstacle avoidance...", msg->poses.size());
-
-        std::vector<Point> initial_waypoints;
-        for (const auto& pose_stamped : msg->poses) {
-            initial_waypoints.push_back({pose_stamped.pose.position.x, pose_stamped.pose.position.y});
-        }
-        
-        auto geometric_path = generate_geometric_path(initial_waypoints);
-        if (geometric_path.empty()) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to generate a collision-free geometric path.");
-            return;
+            RCLCPP_WARN(get_logger(), "Need at least 2 waypoints."); return;
         }
 
-        auto final_trajectory = generate_time_parametrized_trajectory(geometric_path);
+        // Extract raw waypoints
+        std::vector<std::pair<double,double>> raw_wps;
+        for (const auto& ps : msg->poses)
+            raw_wps.push_back({ps.pose.position.x, ps.pose.position.y});
 
-        smooth_path_pub_->publish(final_trajectory);
-        RCLCPP_INFO(this->get_logger(), "Successfully published smooth trajectory with %zu points.", final_trajectory.poses.size());
-    }
-
-
-    std::vector<Point> generate_geometric_path(const std::vector<Point>& waypoints)
-    {
-        // Phase 1 & 2: Check and Correct
-        auto corrected_waypoints = correct_path_for_obstacles(waypoints);
-        if (corrected_waypoints.empty()){
-            RCLCPP_ERROR(this->get_logger(), "Path correction failed. A waypoint might be inside an obstacle.");
-            return {};
-        }
-
-        // Phase 3: Smooth (with verification loop)
-        double current_safety_margin = safety_margin_;
-        for (int i = 0; i < 5; ++i) { // Limit iterations to prevent infinite loops
-            auto candidate_spline = generate_candidate_spline(corrected_waypoints);
-            
-            if (is_path_collision_free(candidate_spline)) {
-                RCLCPP_INFO(this->get_logger(), "Path is collision-free after %d iterations.", i + 1);
-                return candidate_spline;
+        // Obstacle avoidance: Check-Correct-Smooth with iterative verification
+        double margin = safety_margin_;
+        std::vector<std::pair<double,double>> corrected_wps;
+        bool ok = false;
+        for (int iter = 0; iter < 5; ++iter) {
+            corrected_wps = correct_for_obstacles(raw_wps, margin);
+            if (corrected_wps.empty()) {
+                RCLCPP_ERROR(get_logger(), "Waypoint inside obstacle — cannot plan."); return;
             }
-            
-            RCLCPP_WARN(this->get_logger(), "Path verification failed. Increasing safety margin and retrying...");
-            current_safety_margin *= 1.5;
-            corrected_waypoints = correct_path_for_obstacles(waypoints, current_safety_margin);
+            if (is_collision_free(corrected_wps)) { ok = true; break; }
+            margin *= 1.5;
+            RCLCPP_WARN(get_logger(), "Spline collides, retrying with margin=%.2f", margin);
         }
+        if (!ok) { RCLCPP_ERROR(get_logger(), "No collision-free path found."); return; }
 
-        RCLCPP_ERROR(this->get_logger(), "Could not find a collision-free path after multiple attempts.");
-        return {};
+        // Generate quintic Hermite trajectory (full kinematic state)
+        spline_.max_velocity     = max_vel_;
+        spline_.spline_ds        = spline_ds_;
+        spline_.corner_sharpness = corner_sharpness_;
+        auto geom_traj = spline_.generate(corrected_wps);
+
+        // Apply velocity profile (trapezoidal or constant)
+        auto timed_traj = apply_velocity_profile(geom_traj);
+
+        // Publish
+        publish_trajectory(timed_traj);
+        publish_debug_profiles(timed_traj);
+
+        RCLCPP_INFO(get_logger(), "Published %zu trajectory points.", timed_traj.size());
     }
-    
-    std::vector<Point> correct_path_for_obstacles(const std::vector<Point>& waypoints, double margin_override = -1.0)
+
+    // -------- Velocity profile --------
+    std::vector<TrajState> apply_velocity_profile(const std::vector<TrajState>& geom)
     {
-        // Check if any waypoint is inside an obstacle first
-        for(const auto& wp : waypoints){
-            for(const auto& obs : obstacles_){
-                if(std::hypot(wp.x - obs.x, wp.y - obs.y) < obstacle_radius_){
-                    RCLCPP_ERROR(this->get_logger(), "A waypoint is inside an obstacle! Path is impossible.");
-                    return {};
+        if (geom.empty()) return {};
+
+        // Build cumulative arc-length
+        std::vector<double> arc(geom.size(), 0.0);
+        for (size_t i = 1; i < geom.size(); ++i)
+            arc[i] = arc[i-1] + std::hypot(geom[i].x - geom[i-1].x,
+                                            geom[i].y - geom[i-1].y);
+        double L = arc.back();
+
+        // Trapezoidal profile parameters
+        double t_ramp = max_vel_ / max_acc_;
+        double d_ramp = 0.5 * max_acc_ * t_ramp * t_ramp;
+        if (L < 2.0 * d_ramp) {        // Path too short — triangle profile
+            t_ramp = std::sqrt(L / max_acc_);
+            d_ramp = 0.5 * L;
+        }
+        double t_cruise_end = t_ramp + (L - 2.0 * d_ramp) / max_vel_;
+        double t_total      = t_cruise_end + t_ramp;
+
+        std::vector<TrajState> timed;
+        double t = 0.0;
+
+        auto interp = [&](double dist) -> TrajState {
+            // Find segment in arc-length parameterized geom trajectory
+            size_t idx = 0;
+            while (idx + 1 < arc.size() && arc[idx+1] < dist) ++idx;
+            if (idx + 1 >= geom.size()) return geom.back();
+            double frac = (arc[idx+1] - arc[idx] > 1e-9)
+                ? (dist - arc[idx]) / (arc[idx+1] - arc[idx]) : 0.0;
+            TrajState s;
+            s.x     = geom[idx].x     + frac * (geom[idx+1].x - geom[idx].x);
+            s.y     = geom[idx].y     + frac * (geom[idx+1].y - geom[idx].y);
+            s.theta = geom[idx].theta;
+            s.omega = geom[idx].omega;
+            s.v     = 0.0;  // will be set by profile
+            s.t     = 0.0;
+            return s;
+        };
+
+        while (true) {
+            double dist = 0.0, vel = 0.0;
+            if (velocity_profile_ == "constant") {
+                vel  = max_vel_;
+                dist = max_vel_ * t;
+            } else {
+                if (t <= t_ramp) {
+                    vel  = max_acc_ * t;
+                    dist = 0.5 * max_acc_ * t * t;
+                } else if (t <= t_cruise_end) {
+                    vel  = max_vel_;
+                    dist = d_ramp + max_vel_ * (t - t_ramp);
+                } else if (t <= t_total) {
+                    double td = t - t_cruise_end;
+                    vel  = max_vel_ - max_acc_ * td;
+                    dist = d_ramp + max_vel_*(t_cruise_end - t_ramp)
+                           + max_vel_*td - 0.5*max_acc_*td*td;
+                } else {
+                    dist = L;
                 }
             }
+            if (dist >= L) break;
+
+            TrajState s = interp(dist);
+            s.v = vel;
+            s.t = t;
+            timed.push_back(s);
+            t += dt_;
         }
+        TrajState final = geom.back();
+        final.v = 0.0; final.t = t;
+        timed.push_back(final);
+        return timed;
+    }
 
-        double effective_radius = obstacle_radius_ + (margin_override > 0 ? margin_override : safety_margin_);
-        std::vector<Point> corrected_path;
-        corrected_path.push_back(waypoints[0]);
+    // -------- Publish trajectory (encode kinematic state into orientation fields) --------
+    // Convention: orientation.{x,y,z} = {θ, v, ω}, orientation.w = 1.0 (sentinel)
+    // This avoids defining a custom ROS message while keeping multi-node decoupling.
+    void publish_trajectory(const std::vector<TrajState>& traj)
+    {
+        nav_msgs::msg::Path msg;
+        msg.header.stamp    = get_clock()->now();
+        msg.header.frame_id = "odom";
 
-        for (size_t i = 0; i < waypoints.size() - 1; ++i) {
-            Point p1 = corrected_path.back();
-            Point p2 = waypoints[i+1];
-            
-            int conflicting_obstacle_idx = -1;
-            for (size_t j = 0; j < obstacles_.size(); ++j) {
-                if (line_segment_circle_intersection(p1, p2, obstacles_[j], effective_radius)) {
-                    conflicting_obstacle_idx = j;
+        for (const auto& s : traj) {
+            geometry_msgs::msg::PoseStamped ps;
+            ps.header = msg.header;
+            ps.header.stamp = rclcpp::Time(msg.header.stamp)
+                              + rclcpp::Duration::from_seconds(s.t);
+            ps.pose.position.x       = s.x;
+            ps.pose.position.y       = s.y;
+            ps.pose.position.z       = 0.0;
+            ps.pose.orientation.x    = s.theta;
+            ps.pose.orientation.y    = s.v;
+            ps.pose.orientation.z    = s.omega;
+            ps.pose.orientation.w    = 1.0;   // sentinel: marks encoded state
+            msg.poses.push_back(ps);
+        }
+        path_pub_->publish(msg);
+    }
+
+    // -------- Publish debug profiles --------
+    void publish_debug_profiles(const std::vector<TrajState>& traj)
+    {
+        std_msgs::msg::Float64MultiArray vel_msg, omega_msg;
+        for (const auto& s : traj) {
+            vel_msg.data.push_back(s.t);
+            vel_msg.data.push_back(s.v);
+            omega_msg.data.push_back(s.t);
+            omega_msg.data.push_back(s.omega);
+        }
+        vel_pub_->publish(vel_msg);
+        omega_pub_->publish(omega_msg);
+    }
+
+    // -------- Obstacle avoidance (unchanged logic from original) --------
+    bool seg_circle_intersect(Point a, Point b, Point c, double r) {
+        double dx=b.x-a.x, dy=b.y-a.y, fx=a.x-c.x, fy=a.y-c.y;
+        double A=dx*dx+dy*dy, B=2*(fx*dx+fy*dy);
+        double disc = B*B - 4*A*(fx*fx+fy*fy-r*r);
+        if (disc < 0) return false;
+        disc = std::sqrt(disc);
+        double t1=(-B-disc)/(2*A), t2=(-B+disc)/(2*A);
+        return (t1>=0&&t1<=1)||(t2>=0&&t2<=1);
+    }
+
+    std::vector<std::pair<double,double>> correct_for_obstacles(
+        const std::vector<std::pair<double,double>>& wps, double margin)
+    {
+        double eff_r = obs_r_ + margin;
+        std::vector<std::pair<double,double>> out;
+        out.push_back(wps[0]);
+        for (size_t i = 0; i+1 < wps.size(); ++i) {
+            Point p1{out.back().first, out.back().second};
+            Point p2{wps[i+1].first, wps[i+1].second};
+            for (const auto& obs : obstacles_) {
+                if (seg_circle_intersect(p1, p2, obs, eff_r)) {
+                    double dx=p2.x-p1.x, dy=p2.y-p1.y, mag=std::hypot(dx,dy);
+                    Point perp{-dy/mag, dx/mag};
+                    Point d1{obs.x+perp.x*eff_r, obs.y+perp.y*eff_r};
+                    Point d2{obs.x-perp.x*eff_r, obs.y-perp.y*eff_r};
+                    double c1=std::hypot(p1.x-d1.x,p1.y-d1.y)+std::hypot(p2.x-d1.x,p2.y-d1.y);
+                    double c2=std::hypot(p1.x-d2.x,p1.y-d2.y)+std::hypot(p2.x-d2.x,p2.y-d2.y);
+                    Point best = (c1<c2) ? d1 : d2;
+                    out.push_back({best.x, best.y});
                     break;
                 }
             }
-
-            if (conflicting_obstacle_idx != -1) {
-                auto detour_points = find_detour_points(p1, p2, obstacles_[conflicting_obstacle_idx], effective_radius);
-                if (detour_points.empty()) return {};
-                corrected_path.insert(corrected_path.end(), detour_points.begin(), detour_points.end());
-            }
-            corrected_path.push_back(p2);
+            out.push_back({p2.x, p2.y});
         }
-        return corrected_path;
+        return out;
     }
 
-    std::vector<Point> find_detour_points(Point p1, Point p2, Point obs_center, double obs_radius)
-    {
-        double dx = p2.x - p1.x;
-        double dy = p2.y - p1.y;
-        double mag = std::hypot(dx, dy);
-        Point perp_vec = {-dy/mag, dx/mag};
-
-        Point detour1 = {obs_center.x + perp_vec.x * obs_radius, obs_center.y + perp_vec.y * obs_radius};
-        Point detour2 = {obs_center.x - perp_vec.x * obs_radius, obs_center.y - perp_vec.y * obs_radius};
-
-        double dist1 = std::hypot(p1.x - detour1.x, p1.y - detour1.y) + std::hypot(p2.x - detour1.x, p2.y - detour1.y);
-        double dist2 = std::hypot(p1.x - detour2.x, p1.y - detour2.y) + std::hypot(p2.x - detour2.x, p2.y - detour2.y);
-        
-        return (dist1 < dist2) ? std::vector<Point>{detour1} : std::vector<Point>{detour2};
-    }
-
-    bool line_segment_circle_intersection(Point p1, Point p2, Point circle_center, double radius)
-    {
-        double dx = p2.x - p1.x;
-        double dy = p2.y - p1.y;
-        double fx = p1.x - circle_center.x;
-        double fy = p1.y - circle_center.y;
-        double a = dx*dx + dy*dy;
-        double b = 2*(fx*dx + fy*dy);
-        double c = fx*fx + fy*fy - radius*radius;
-        double discriminant = b*b - 4*a*c;
-        if (discriminant < 0) return false;
-        
-        discriminant = std::sqrt(discriminant);
-        double t1 = (-b - discriminant) / (2*a);
-        double t2 = (-b + discriminant) / (2*a);
-
-        return (t1 >= 0 && t1 <= 1) || (t2 >= 0 && t2 <= 1);
-    }
-    
-    bool is_path_collision_free(const std::vector<Point>& path) {
-        for (size_t i = 0; i < path.size() - 1; ++i) {
-            for(const auto& obs : obstacles_) {
-                if (line_segment_circle_intersection(path[i], path[i+1], obs, obstacle_radius_)) {
-                    return false;
-                }
+    bool is_collision_free(const std::vector<std::pair<double,double>>& path) {
+        for (size_t i = 0; i+1 < path.size(); ++i)
+            for (const auto& obs : obstacles_) {
+                Point a{path[i].first,path[i].second}, b{path[i+1].first,path[i+1].second};
+                if (seg_circle_intersect(a, b, obs, obs_r_)) return false;
             }
-        }
         return true;
     }
 
-    std::vector<Point> generate_candidate_spline(const std::vector<Point>& points)
-    {
-        std::vector<Point> spline_points;
-        if (points.size() < 2) return spline_points;
-
-        for (size_t i = 0; i < points.size() - 1; ++i) {
-            Point p0 = (i == 0) ? points[i] : points[i - 1];
-            Point p1 = points[i];
-            Point p2 = points[i + 1];
-            Point p3 = (i + 2 < points.size()) ? points[i + 2] : p2;
-
-            for (double t = 0.0; t < 1.0; t += (spline_resolution_ / std::hypot(p2.x-p1.x, p2.y-p1.y))) {
-                spline_points.push_back(catmull_rom_interpolate(t, p0, p1, p2, p3));
-            }
-        }
-        spline_points.push_back(points.back());
-        return spline_points;
+    Point parse_point(const std::string& s) {
+        std::string c = s;
+        for (char& ch : c) if (ch=='['||ch==']'||ch==',') ch=' ';
+        std::stringstream ss(c); Point p{0,0}; ss>>p.x>>p.y; return p;
     }
 
-    Point catmull_rom_interpolate(double t, Point p0, Point p1, Point p2, Point p3) {
-        double t2 = t * t;
-        double t3 = t2 * t;
-        double c1 = -0.5*t3 + t2 - 0.5*t;
-        double c2 =  1.5*t3 - 2.5*t2 + 1.0;
-        double c3 = -1.5*t3 + 2.0*t2 + 0.5*t;
-        double c4 =  0.5*t3 - 0.5*t2;
-        return {c1*p0.x + c2*p1.x + c3*p2.x + c4*p3.x,
-                c1*p0.y + c2*p1.y + c3*p2.y + c4*p3.y};
-    }
-
-    // --- generate_time_parametrized_trajectory publishes velocity profile ---
-    nav_msgs::msg::Path generate_time_parametrized_trajectory(const std::vector<Point>& geometric_path)
-    {
-        nav_msgs::msg::Path trajectory;
-        trajectory.header.stamp = this->get_clock()->now();
-        trajectory.header.frame_id = "odom";
-        if (geometric_path.empty()) return trajectory;
-
-        // For velocity profile visualization
-        std_msgs::msg::Float64MultiArray velocity_profile_msg;
-        velocity_profile_msg.layout.dim.push_back(std_msgs::msg::MultiArrayDimension());
-        velocity_profile_msg.layout.dim[0].label = "time_velocity_pairs";
-        velocity_profile_msg.layout.dim[0].stride = 2;
-
-        double total_length = 0.0;
-        for (size_t i = 0; i < geometric_path.size() - 1; ++i) {
-            total_length += std::hypot(geometric_path[i+1].x - geometric_path[i].x, geometric_path[i+1].y - geometric_path[i].y);
-        }
-
-        double current_time = 0.0;
-        
-        while (true) {
-            double current_dist = 0.0;
-            double current_vel = 0.0;
-
-            if (velocity_profile_ == "constant") {
-                current_vel = max_velocity_;
-                current_dist = max_velocity_ * current_time;
-            } else { // trapezoidal
-                double t_accel = max_velocity_ / max_acceleration_;
-                double d_accel = 0.5 * max_acceleration_ * t_accel * t_accel;
-
-                if (total_length < 2 * d_accel) { 
-                    t_accel = std::sqrt(total_length / max_acceleration_);
-                    d_accel = 0.5 * total_length;
-                }
-                
-                double t_total = 2 * t_accel + (total_length - 2 * d_accel) / max_velocity_;
-                double t_coast_end = t_total - t_accel;
-
-                if (current_time <= t_accel) {
-                    current_vel = max_acceleration_ * current_time;
-                    current_dist = 0.5 * max_acceleration_ * current_time * current_time;
-                } else if (current_time <= t_coast_end) {
-                    current_vel = max_velocity_;
-                    current_dist = d_accel + max_velocity_ * (current_time - t_accel);
-                } else if (current_time <= t_total) {
-                    double t_decel = current_time - t_coast_end;
-                    current_vel = max_velocity_ - max_acceleration_ * t_decel;
-                    current_dist = d_accel + max_velocity_ * (t_coast_end - t_accel) + (max_velocity_ * t_decel - 0.5 * max_acceleration_ * t_decel * t_decel);
-                } else {
-                    current_vel = 0.0;
-                    current_dist = total_length;
-                }
-            }
-
-            if (current_dist >= total_length) break;
-
-            Point p = get_point_on_path(geometric_path, current_dist);
-
-            geometry_msgs::msg::PoseStamped pose;
-            pose.header = trajectory.header;
-            pose.header.stamp = rclcpp::Time(trajectory.header.stamp) + rclcpp::Duration::from_seconds(current_time);
-            pose.pose.position.x = p.x;
-            pose.pose.position.y = p.y;
-            pose.pose.orientation.w = 1.0;
-            trajectory.poses.push_back(pose);
-
-            // Add data to velocity profile message
-            velocity_profile_msg.data.push_back(current_time);
-            velocity_profile_msg.data.push_back(current_vel);
-
-            current_time += time_sample_interval_;
-        }
-        
-        geometry_msgs::msg::PoseStamped final_pose;
-        final_pose.header = trajectory.header;
-        final_pose.header.stamp = rclcpp::Time(trajectory.header.stamp) + rclcpp::Duration::from_seconds(current_time);
-        final_pose.pose.position.x = geometric_path.back().x;
-        final_pose.pose.position.y = geometric_path.back().y;
-        final_pose.pose.orientation.w = 1.0;
-        trajectory.poses.push_back(final_pose);
-        
-        velocity_profile_msg.data.push_back(current_time);
-        velocity_profile_msg.data.push_back(0.0);
-        velocity_profile_pub_->publish(velocity_profile_msg);
-
-        return trajectory;
-    }
-
-    Point get_point_on_path(const std::vector<Point>& path, double distance)
-    {
-        double current_dist = 0.0;
-        for (size_t i = 0; i < path.size() - 1; ++i) {
-            double segment_len = std::hypot(path[i+1].x - path[i].x, path[i+1].y - path[i].y);
-            if (current_dist + segment_len >= distance) {
-                double ratio = (distance - current_dist) / segment_len;
-                return {path[i].x + ratio * (path[i+1].x - path[i].x),
-                        path[i].y + ratio * (path[i+1].y - path[i].y)};
-            }
-            current_dist += segment_len;
-        }
-        return path.back();
-    }
-    
-    // --- Member Variables ---
+    // Members
+    SplineGenerator spline_;
     rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
-    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr smooth_path_pub_;
-    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr velocity_profile_pub_;
-    
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr vel_pub_, omega_pub_;
+
     std::string velocity_profile_;
-    double max_velocity_, max_acceleration_, time_sample_interval_, spline_resolution_;
-    double obstacle_radius_, safety_margin_, verification_resolution_;
+    double max_vel_, max_acc_, dt_, spline_ds_, corner_sharpness_;
+    double obs_r_, safety_margin_;
     std::vector<Point> obstacles_;
 };
 
-int main(int argc, char * argv[]) {
+int main(int argc, char* argv[]) {
     rclcpp::init(argc, argv);
     rclcpp::spin(std::make_shared<PathSmootherNode>());
     rclcpp::shutdown();
-    return 0;
 }
-

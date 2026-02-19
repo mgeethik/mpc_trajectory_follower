@@ -1,194 +1,285 @@
 #include "rclcpp/rclcpp.hpp"
 #include "nav_msgs/msg/odometry.hpp"
+#include "visualization_msgs/msg/marker.hpp"
 #include "nav_msgs/msg/path.hpp"
 #include "geometry_msgs/msg/twist_stamped.hpp"
+#include "std_msgs/msg/bool.hpp"
 #include "tf2/LinearMath/Quaternion.h"
 #include "tf2/LinearMath/Matrix3x3.h"
+#include "robot_navigation/mpc_controller.hpp"
+
+
 #include <cmath>
 #include <vector>
 #include <limits>
-#include <algorithm>
 
-class TrajectoryTrackerNode : public rclcpp::Node
-{
+class TrajectoryTrackerNode : public rclcpp::Node {
 public:
     TrajectoryTrackerNode() : Node("trajectory_tracker_node")
     {
         // Parameters
-        this->declare_parameter<double>("kp_angular", 2.5);
-        this->get_parameter("kp_angular", kp_angular_);
-        this->declare_parameter<double>("ki_angular", 0.5);
-        this->get_parameter("ki_angular", ki_angular_);
-        this->declare_parameter<double>("kd_angular", 0.5);
-        this->get_parameter("kd_angular", kd_angular_);
-        this->declare_parameter<double>("kp_cross_track", 0.5);
-        this->get_parameter("kp_cross_track", kp_cross_track_);
-        this->declare_parameter<double>("max_linear_vel", 0.22);
-        this->get_parameter("max_linear_vel", max_linear_vel_);
-        this->declare_parameter<double>("max_angular_vel", 2.84);
-        this->get_parameter("max_angular_vel", max_angular_vel_);
-        this->declare_parameter<double>("goal_tolerance", 0.1);
-        this->get_parameter("goal_tolerance", goal_tolerance_);
+        declare_parameter("max_linear_vel",  0.22);
+        declare_parameter("max_angular_vel", 2.84);
+        declare_parameter("goal_tolerance",  0.12);
+        declare_parameter("mpc_horizon",     20);
+        declare_parameter("mpc_dt",          0.02);
+        declare_parameter("mpc_q_x",         150.0);
+        declare_parameter("mpc_q_y",         150.0);
+        declare_parameter("mpc_q_theta",      80.0);
+        declare_parameter("mpc_r_v",          50.0);
+        declare_parameter("mpc_r_w",          50.0);
+        declare_parameter("mpc_terminal_scale", 5.0);
+        declare_parameter("lookahead_min",    2);
+        declare_parameter("lookahead_max",    10);
+        declare_parameter("lookahead_gain",   20.0);
 
-        // Publishers and Subscribers
-        odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-            "/odom", 10, std::bind(&TrajectoryTrackerNode::odom_callback, this, std::placeholders::_1));
-        path_sub_ = this->create_subscription<nav_msgs::msg::Path>(
-            "/planned_path", 10, std::bind(&TrajectoryTrackerNode::path_callback, this, std::placeholders::_1));
-        
-        cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("/cmd_vel", 10);
+        get_parameter("max_linear_vel",      max_v_);
+        get_parameter("max_angular_vel",     max_w_);
+        get_parameter("goal_tolerance",      goal_tol_);
+        get_parameter("mpc_horizon",         N_);
+        get_parameter("mpc_dt",              mpc_dt_);
+        get_parameter("lookahead_min",       lookahead_min_);
+        get_parameter("lookahead_max",       lookahead_max_);
+        get_parameter("lookahead_gain",      lookahead_gain_);
 
-        // Control loop timer
-        control_loop_timer_ = this->create_wall_timer(
-            std::chrono::milliseconds(20), // 50 Hz
+        // Configure MPC
+        mpc_ = std::make_unique<LPVMPCController>(N_, mpc_dt_);
+        mpc_->v_max          = max_v_;
+        mpc_->w_max          = max_w_;
+        get_parameter("mpc_q_x",            mpc_->q_x);
+        get_parameter("mpc_q_y",            mpc_->q_y);
+        get_parameter("mpc_q_theta",        mpc_->q_theta);
+        get_parameter("mpc_r_v",            mpc_->r_v);
+        get_parameter("mpc_r_w",            mpc_->r_w);
+        get_parameter("mpc_terminal_scale", mpc_->terminal_scale);
+
+        // Pub / Sub
+        odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+            "/odom", 10, std::bind(&TrajectoryTrackerNode::on_odom, this, std::placeholders::_1));
+        path_sub_ = create_subscription<nav_msgs::msg::Path>(
+            "/planned_path", 10, std::bind(&TrajectoryTrackerNode::on_path, this, std::placeholders::_1));
+        cmd_pub_  = create_publisher<geometry_msgs::msg::TwistStamped>("/cmd_vel", 10);
+        goal_pub_ = create_publisher<std_msgs::msg::Bool>("/navigation/goal_reached", 10);
+        lookahead_pub_ = create_publisher<visualization_msgs::msg::Marker>("/visualization/lookahead_target", 10);
+        horizon_pub_ = create_publisher<nav_msgs::msg::Path>("/visualization/mpc_horizon", 10);
+
+        // Control loop
+        timer_ = create_wall_timer(
+            std::chrono::duration<double>(mpc_dt_),
             std::bind(&TrajectoryTrackerNode::control_loop, this));
-            
-        RCLCPP_INFO(this->get_logger(), "Trajectory Tracker Initialized.");
+
+        RCLCPP_INFO(get_logger(), "LPV-MPC Tracker ready. N=%d, dt=%.3fs", N_, mpc_dt_);
     }
 
 private:
-    // Callbacks
-    void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
+    void on_odom(const nav_msgs::msg::Odometry::SharedPtr msg)
     {
-        current_pose_ = msg->pose.pose;
-        tf2::Quaternion q(
-            current_pose_.orientation.x,
-            current_pose_.orientation.y,
-            current_pose_.orientation.z,
-            current_pose_.orientation.w);
-        tf2::Matrix3x3 m(q);
-        double roll, pitch;
-        m.getRPY(roll, pitch, current_yaw_);
-        odom_received_ = true;
+        x_ = msg->pose.pose.position.x;
+        y_ = msg->pose.pose.position.y;
+
+        tf2::Quaternion q(msg->pose.pose.orientation.x, msg->pose.pose.orientation.y,
+                          msg->pose.pose.orientation.z, msg->pose.pose.orientation.w);
+        tf2::Matrix3x3 m(q); double roll, pitch;
+        m.getRPY(roll, pitch, theta_);
+
+        v_meas_ = msg->twist.twist.linear.x;
+        w_meas_ = msg->twist.twist.angular.z;
+        odom_ok_ = true;
     }
 
-    void path_callback(const nav_msgs::msg::Path::SharedPtr msg)
+    void on_path(const nav_msgs::msg::Path::SharedPtr msg)
     {
-        path_ = *msg;
-        path_received_ = true;
-        path_index_ = 0; 
-        integral_error_ = 0.0;
-        last_error_ = 0.0;
+        px_.clear(); py_.clear(); pth_.clear(); pv_.clear(); pw_.clear();
+        path_idx_ = 0;
         goal_reached_ = false;
-        RCLCPP_INFO(this->get_logger(), "New trajectory received with %zu points.", path_.poses.size());
+        mpc_->reset();  // Reset warm-start when new path arrives
+
+        for (const auto& ps : msg->poses) {
+            px_.push_back(ps.pose.position.x);
+            py_.push_back(ps.pose.position.y);
+
+            bool encoded = (std::abs(ps.pose.orientation.w - 1.0) < 1e-5);
+            if (encoded) {
+                pth_.push_back(ps.pose.orientation.x);  // θ
+                pv_.push_back(ps.pose.orientation.y);   // v
+                pw_.push_back(ps.pose.orientation.z);   // ω
+            } else {
+                // Fallback: estimate heading from consecutive points
+                pth_.push_back(0.0);
+                pv_.push_back(max_v_);
+                pw_.push_back(0.0);
+            }
+        }
+
+        // Fill heading fallback for unencoded paths
+        for (size_t i = 0; i < pth_.size(); ++i) {
+            if (pth_[i] == 0.0 && i + 1 < pth_.size()) {
+                pth_[i] = std::atan2(py_[i+1] - py_[i], px_[i+1] - px_[i]);
+            }
+        }
+
+        path_ok_ = true;
+        RCLCPP_INFO(get_logger(), "Trajectory received: %zu points.", px_.size());
     }
 
-    // Main control logic
+    // Bounded forward search for closest trajectory point.
+    // Monotonically increases path_idx_ (robot can't go backward on the path).
+    size_t find_closest(size_t start_from)
+    {
+        size_t best = start_from;
+        double best_d = std::numeric_limits<double>::max();
+        size_t search_end = std::min(start_from + 300, px_.size());
+
+        for (size_t i = start_from; i < search_end; ++i) {
+            double d = std::hypot(x_ - px_[i], y_ - py_[i]);
+            if (d < best_d) { best_d = d; best = i; }
+        }
+        return best;
+    }
+
+    // Normalize angle to [-π, π]
+    static double wrap(double a) {
+        while (a >  M_PI) a -= 2*M_PI;
+        while (a < -M_PI) a += 2*M_PI;
+        return a;
+    }
+
     void control_loop()
     {
-        if (!odom_received_ || !path_received_ || path_.poses.empty() || goal_reached_)
-        {
+        if (!odom_ok_ || !path_ok_ || px_.empty() || goal_reached_) return;
+
+        // Check goal
+        double d_goal = std::hypot(x_ - px_.back(), y_ - py_.back());
+        if (d_goal < goal_tol_ && path_idx_ > px_.size() * 8 / 10) {
+            RCLCPP_INFO(get_logger(), "Goal reached! dist=%.3fm", d_goal);
+            goal_reached_ = true;
+            send_zero();
+            std_msgs::msg::Bool b; b.data = true; goal_pub_->publish(b);
             return;
         }
 
-        if (path_index_ > path_.poses.size() * 0.8) 
-        {
-            double dist_to_goal = std::hypot(
-                current_pose_.position.x - path_.poses.back().pose.position.x,
-                current_pose_.position.y - path_.poses.back().pose.position.y);
+        // Update closest path index (forward only)
+        size_t closest = find_closest(path_idx_);
+        if (closest > path_idx_) path_idx_ = closest;
 
-            if (dist_to_goal < goal_tolerance_)
-            {
-                RCLCPP_INFO(this->get_logger(), "Goal reached!");
-                goal_reached_ = true;
-                auto stop_cmd = std::make_unique<geometry_msgs::msg::TwistStamped>();
-                stop_cmd->header.stamp = this->get_clock()->now();
-                cmd_vel_pub_->publish(*stop_cmd);
-                return;
-            }
+        // ---- Adaptive lookahead ----
+        // Faster robot → look further ahead → smoother tracking, less lag on curves.
+        // Slower robot → tighter lookahead → more responsive to path deviations.
+        double speed_est = std::abs(v_meas_);
+        int lookahead = static_cast<int>(
+            std::clamp(lookahead_min_ + lookahead_gain_ * speed_est,
+                       static_cast<double>(lookahead_min_),
+                       static_cast<double>(lookahead_max_)));
+        size_t target_idx = std::min(path_idx_ + static_cast<size_t>(lookahead),
+                                     px_.size() - 1);
+
+        // ---- Build MPC reference over horizon ----
+        Eigen::Vector3d x0(x_, y_, theta_);
+        std::vector<RefState> refs;
+        refs.reserve(N_ + 1);
+
+        double prev_theta = theta_;
+        for (int k = 0; k <= N_; ++k) {
+            size_t idx = std::min(target_idx + static_cast<size_t>(k), px_.size()-1);
+            RefState rs;
+            rs.x = px_[idx]; rs.y = py_[idx];
+
+            // Unwrap heading angle (avoids ±π wrapping discontinuities in cost function)
+            double raw_theta = pth_[idx];
+            rs.theta = prev_theta + wrap(raw_theta - prev_theta);
+            prev_theta = rs.theta;
+
+            rs.v     = pv_[idx];
+            rs.omega = pw_[idx];
+            refs.push_back(rs);
         }
 
-        // Find the closest point on the path
-        size_t closest_idx = 0;
-        double min_dist_sq = std::numeric_limits<double>::max();
-        for (size_t i = path_index_; i < path_.poses.size(); ++i)
-        {
-            double dist_sq = std::pow(current_pose_.position.x - path_.poses[i].pose.position.x, 2) +
-                             std::pow(current_pose_.position.y - path_.poses[i].pose.position.y, 2);
-            if (dist_sq < min_dist_sq)
-            {
-                min_dist_sq = dist_sq;
-                closest_idx = i;
-            }
+        // ---- Solve MPC ----
+        auto sol = mpc_->solve(x0, refs);
+        Eigen::Vector2d u = sol.u;
+
+        // ---- Publish command ----
+        auto cmd = std::make_unique<geometry_msgs::msg::TwistStamped>();
+        cmd->header.stamp    = get_clock()->now();
+        cmd->twist.linear.x  = u(0);
+        cmd->twist.angular.z = u(1);
+        cmd_pub_->publish(*cmd);
+
+        // Publish lookahead target as a sphere marker
+        visualization_msgs::msg::Marker marker;
+        marker.header.frame_id = "odom";
+        marker.header.stamp = get_clock()->now();
+        marker.ns = "lookahead";
+        marker.id = 0;
+        marker.type = visualization_msgs::msg::Marker::SPHERE;
+        marker.action = visualization_msgs::msg::Marker::ADD;
+        marker.pose.position.x = px_[target_idx];
+        marker.pose.position.y = py_[target_idx];
+        marker.pose.position.z = 0.05;
+        marker.pose.orientation.w = 1.0;
+        marker.scale.x = 0.15;
+        marker.scale.y = 0.15;
+        marker.scale.z = 0.15;
+        marker.color.r = 1.0f;
+        marker.color.g = 0.5f;
+        marker.color.b = 0.0f;
+        marker.color.a = 1.0f;
+        lookahead_pub_->publish(marker);
+
+        // Publish MPC predicted trajectory (actual optimizer output, starts from robot position)
+        nav_msgs::msg::Path horizon_path;
+        horizon_path.header.frame_id = "odom";
+        horizon_path.header.stamp = get_clock()->now();
+
+        for (const auto& state : sol.pred_traj) {
+            geometry_msgs::msg::PoseStamped ps;
+            ps.header = horizon_path.header;
+            ps.pose.position.x = state(0);
+            ps.pose.position.y = state(1);
+            ps.pose.position.z = 0.0;
+            ps.pose.orientation.w = 1.0;
+            horizon_path.poses.push_back(ps);
         }
-        path_index_ = closest_idx;
+        horizon_pub_->publish(horizon_path);
 
-        // Determine path angle at the closest point
-        double path_angle = 0.0;
-        // When at the end of the path, aim directly for the final point
-        // instead of trying to match the last segment's angle. This creates a more stable "homing" behavior.
-        if (path_index_ >= path_.poses.size() - 1)
-        {
-             path_angle = std::atan2(
-                path_.poses.back().pose.position.y - current_pose_.position.y,
-                path_.poses.back().pose.position.x - current_pose_.position.x);
-        }
-        else 
-        {
-            path_angle = std::atan2(
-                path_.poses[path_index_ + 1].pose.position.y - path_.poses[path_index_].pose.position.y,
-                path_.poses[path_index_ + 1].pose.position.x - path_.poses[path_index_].pose.position.x);
-        }
-
-        // Calculate cross-track error
-        double dx = path_.poses[path_index_].pose.position.x - current_pose_.position.x;
-        double dy = path_.poses[path_index_].pose.position.y - current_pose_.position.y;
-        double cross_track_error = std::sin(path_angle - current_yaw_) * std::hypot(dx, dy);
-        
-        // Calculate heading error
-        double heading_error = path_angle - current_yaw_;
-        while (heading_error > M_PI) heading_error -= 2 * M_PI;
-        while (heading_error < -M_PI) heading_error += 2 * M_PI;
-
-        // PID controller logic
-        integral_error_ += heading_error;
-        double derivative_error = heading_error - last_error_;
-        last_error_ = heading_error;
-
-        // Create and publish a TwistStamped message
-        auto cmd_vel_stamped = std::make_unique<geometry_msgs::msg::TwistStamped>();
-        cmd_vel_stamped->header.stamp = this->get_clock()->now();
-        
-        cmd_vel_stamped->twist.angular.z = kp_angular_ * heading_error + 
-                                           ki_angular_ * integral_error_ + 
-                                           kd_angular_ * derivative_error +
-                                           kp_cross_track_ * cross_track_error;
-
-        // Limit angular velocity
-        cmd_vel_stamped->twist.angular.z = std::clamp(cmd_vel_stamped->twist.angular.z, -max_angular_vel_, max_angular_vel_);
-        
-        // Reduce linear velocity during turns
-        cmd_vel_stamped->twist.linear.x = max_linear_vel_ * (1.0 - 0.8 * std::abs(cmd_vel_stamped->twist.angular.z) / max_angular_vel_);
-
-        cmd_vel_pub_->publish(*cmd_vel_stamped);
+        v_meas_ = u(0);
+        w_meas_ = u(1);
     }
 
-    // Member variables
+    void send_zero() {
+        for (int i = 0; i < 5; ++i) {
+            auto c = std::make_unique<geometry_msgs::msg::TwistStamped>();
+            c->header.stamp = get_clock()->now();
+            cmd_pub_->publish(*c);
+        }
+    }
+
+    // Members
+    std::unique_ptr<LPVMPCController> mpc_;
+
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
-    rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr cmd_vel_pub_;
-    rclcpp::TimerBase::SharedPtr control_loop_timer_;
+    rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr cmd_pub_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr goal_pub_;
+    rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr lookahead_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr horizon_pub_;
+    rclcpp::TimerBase::SharedPtr timer_;
 
-    geometry_msgs::msg::Pose current_pose_;
-    double current_yaw_ = 0.0;
-    bool odom_received_ = false;
+    double x_=0, y_=0, theta_=0, v_meas_=0, w_meas_=0;
+    bool odom_ok_ = false;
 
-    nav_msgs::msg::Path path_;
-    bool path_received_ = false;
-    size_t path_index_ = 0;
-
-    double kp_angular_, ki_angular_, kd_angular_, kp_cross_track_;
-    double max_linear_vel_, max_angular_vel_, goal_tolerance_;
-    double integral_error_ = 0.0;
-    double last_error_ = 0.0;
+    std::vector<double> px_, py_, pth_, pv_, pw_;
+    bool path_ok_ = false;
+    size_t path_idx_ = 0;
     bool goal_reached_ = false;
+
+    double max_v_, max_w_, goal_tol_, mpc_dt_;
+    int N_, lookahead_min_, lookahead_max_;
+    double lookahead_gain_;
 };
 
-int main(int argc, char * argv[])
-{
+int main(int argc, char* argv[]) {
     rclcpp::init(argc, argv);
     rclcpp::spin(std::make_shared<TrajectoryTrackerNode>());
     rclcpp::shutdown();
-    return 0;
 }
-

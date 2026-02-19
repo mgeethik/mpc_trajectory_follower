@@ -24,7 +24,7 @@ public:
         this->get_parameter("obstacle_radius", obstacle_radius_);
         
         // **FIX**: Declare and parse obstacle_centers as a string array
-        this->declare_parameter<std::vector<std::string>>("obstacle_centers", {});
+        this->declare_parameter<std::vector<std::string>>("obstacle_centers", std::vector<std::string>{});
         auto obstacle_strings = this->get_parameter("obstacle_centers").as_string_array();
         for (const auto& s : obstacle_strings) {
             obstacles_.push_back(parse_point_string(s));
